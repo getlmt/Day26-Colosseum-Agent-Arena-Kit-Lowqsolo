@@ -89,12 +89,17 @@ __all__ = [
     "ROUNDS_PER_DUEL",
     "SAFE_STARTING_RESERVE",
     "CATALOG_TRAP_TOOLS",
+    "CATALOG_CHEAP_MASKS",
     "DEPRECATED_SUCCESSORS",
+    "DRIFTING_PATH_IDS",
     "disciplined_round_cost",
     "careless_round_cost",
+    "estimate_cost",
     "is_catalog_trap",
     "cheap_mask",
     "successor_of",
+    "path_id_of",
+    "is_drifting",
     "BudgetPacer",
     "ReplicaChoice",
     "pick_replica",
@@ -127,6 +132,26 @@ DEPRECATED_SUCCESSORS: Mapping[tuple[str, str], tuple[str, str]] = {
     ("slides", "search"): ("slides", "query"),
 }
 
+# The cheap mask a catalog-trap call is rewritten to (JOB 4): the one field a
+# "which servers / which terms exist" question actually needs. Both land at
+# 2 credits against the real cost table, instead of 12 / 10 for the default dump.
+CATALOG_CHEAP_MASKS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("registry", "list_servers"): ("name",),
+    ("glossary", "list_terms"): ("term",),
+}
+
+# The measured drift set of world df8c55dabb35 (`drift.json`, `drifts: true`),
+# copied in as DATA because `Gateway.decide` may not do I/O. 16 of the 22
+# indexed path_ids drift; the other 6 (04032b0c, 594ef4c1, 61a20716, 6cc8191a,
+# b3616a68, b55e1f40) are byte-identical across replicas, so for them "which
+# replica" changes nothing. Only Frame/Deck/Section anchors carry a path_id.
+DRIFTING_PATH_IDS: frozenset[str] = frozenset({
+    "053195a5", "0e11ae43", "170c4d17", "28e68faa", "3326cb76", "45098556",
+    "72f75709", "75811e75", "7a8d8046", "a13b20e6", "a284ae8b", "abd20c68",
+    "c5418ab5", "d8f95a7b", "e0614beb", "f2696f5f",
+})
+_PATH_ID_NAMESPACES = frozenset({"Frame", "Deck", "Section"})
+
 
 def disciplined_round_cost() -> int:
     """The module docstring's "DISCIPLINED" total, computed live against
@@ -148,6 +173,16 @@ def careless_round_cost() -> int:
         + _spec_cost("glossary", "list_terms")
         + 3 * _spec_cost("slides", "get_frame", fields=("*",))
     )
+
+
+def estimate_cost(server: str, tool: str, fields: tuple[str, ...] = (), n_rows: int = 1) -> int | None:
+    """The real-table price of one call, or `None` when `(server, tool)` is not
+    a known tool (or the mask names an unknown field). Never raises — JOB 4
+    calls this from inside `Gateway.decide`, where an exception is a penalty."""
+    try:
+        return int(_spec_cost(server, tool, fields=tuple(fields), n_rows=n_rows))
+    except Exception:
+        return None
 
 
 def is_catalog_trap(server: str, tool: str, fields: tuple[str, ...]) -> bool:
@@ -188,6 +223,24 @@ def successor_of(server: str, tool: str) -> tuple[str, str] | None:
     and removes the `wasteful` "used a deprecated tool" detector hit
     (CONTRACTS.md 6.4) entirely."""
     return DEPRECATED_SUCCESSORS.get((server, tool))
+
+
+def path_id_of(anchor: Any) -> str | None:
+    """The `path_id` of a `Frame:`/`Deck:`/`Section:` anchor string (its slug),
+    else `None`. Parsed by hand — `ns:slug[/rev][/idx][#span]` — so this never
+    raises on whatever a model typed into an `anchor=` argument."""
+    if not isinstance(anchor, str) or ":" not in anchor:
+        return None
+    ns, _, rest = anchor.partition(":")
+    if ns not in _PATH_ID_NAMESPACES:
+        return None
+    slug = rest.split("#", 1)[0].split("/", 1)[0]
+    return slug or None
+
+
+def is_drifting(path_id: str | None) -> bool:
+    """Whether `path_id` is in the measured drift set (`DRIFTING_PATH_IDS`)."""
+    return isinstance(path_id, str) and path_id in DRIFTING_PATH_IDS
 
 
 @dataclass
@@ -265,27 +318,30 @@ def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bo
     function derives — a real implementation reads it from a
     `registry.provenance` call or from drift knowledge your agent has
     accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
+    logged in `reason`) purely for traceability; callers pass
+    `known_drifting=is_drifting(path_id)` (the measured drift set above).
 
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
-    if known_drifting and prefers_fresh:
+    POLICY: on a drifting path the WORKING replica ("w") is the fresher one.
+    That is not a guess any more — it is the referee's own definition:
+    `stale_read` fires when an answer cites `rev="c"` on a path_id that
+    `drift.json` marks as drifting, for a replica-sensitive ask. CORPUS-FACTS
+    section 2's worked case agrees (day18: 45 working content frames vs 31
+    canonical — working is the more complete copy). So:
+
+      * drifting + `prefers_fresh`      -> "w" (fresher; citing it is never stale)
+      * drifting + not `prefers_fresh`  -> "c" (the caller explicitly wants the
+        canonical side, e.g. to report BOTH sides of a `current_version_of`)
+      * not drifting                    -> "w" (replicas are identical; the
+        working copy is the default the servers serve anyway)"""
+    if known_drifting and not prefers_fresh:
         return ReplicaChoice(
             replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
+            reason=f"path_id={path_id!r} drifts; caller asked for the canonical side explicitly",
+        )
+    if known_drifting:
+        return ReplicaChoice(
+            replica="w",
+            reason=f"path_id={path_id!r} drifts; working is the fresher replica (citing rev=c here is stale_read)",
         )
     return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
 
@@ -404,13 +460,15 @@ if __name__ == "__main__":
         f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
+    # Measured against the live cost table, a disciplined round (query[title,body]
+    # + get_frame(default) + provenance) costs 9 credits, not the 11 the prose
+    # above assumed — so paying full price for all three calls EVERY round, with
+    # no caching at all, survives the whole duel (90 of 100). The margin is thin
+    # (one careless round ends it), which is why ResultCache/pacing still matter.
+    if disciplined * ROUNDS_PER_DUEL <= disciplined_pacer.starting_pool:
+        assert disciplined_pacer.bankrupt_by() is None, disciplined_pacer.bankrupt_by()
+    else:
+        assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
     nine_rounds_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
         nine_rounds_pacer.record_spend(round_no, disciplined)
@@ -439,13 +497,25 @@ if __name__ == "__main__":
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
 
-    print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
-    choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
-    choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=True)
-    print(f"  known_drifting=False -> {choice_clean}")
-    print(f"  known_drifting=True  -> {choice_drifting}")
+    print("\n=== pick_replica: working is the fresher replica on a drifting path ===\n")
+    assert is_drifting(path_id_of("Frame:d8f95a7b/c/031")) is True  # day18, measured drift
+    assert is_drifting(path_id_of("Frame:04032b0c/w/001")) is False  # identical replicas
+    assert path_id_of("Concept:stategraph/w/055") is None  # only Frame/Deck/Section carry a path_id
+    choice_clean = pick_replica(path_id="04032b0c", known_drifting=is_drifting("04032b0c"))
+    choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=is_drifting("d8f95a7b"))
+    choice_canonical = pick_replica(path_id="d8f95a7b", known_drifting=True, prefers_fresh=False)
+    print(f"  non-drifting path       -> {choice_clean}")
+    print(f"  drifting path           -> {choice_drifting}")
+    print(f"  drifting, wants canon.  -> {choice_canonical}")
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_drifting.replica == "w"
+    assert choice_canonical.replica == "c"
+
+    print("\n=== estimate_cost / CATALOG_CHEAP_MASKS ===\n")
+    for (srv, tl), mask in CATALOG_CHEAP_MASKS.items():
+        print(f"  {srv}.{tl}: default={estimate_cost(srv, tl)} cr, cheap {mask}={estimate_cost(srv, tl, mask)} cr")
+        assert estimate_cost(srv, tl, mask) <= 2 < estimate_cost(srv, tl)
+    assert estimate_cost("nope", "nothing") is None
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()
