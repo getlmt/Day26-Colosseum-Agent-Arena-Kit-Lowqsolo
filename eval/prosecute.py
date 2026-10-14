@@ -114,6 +114,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# The cost table names which tools are writes. Imported HERE, at module load —
+# never inside `prosecute()`, which must do no I/O (RULES.md section 4).
+try:
+    from kit.mcp.specs import TOOL_SPECS as _TOOL_SPECS  # type: ignore
+except ImportError:  # pragma: no cover - collaborator file
+    _TOOL_SPECS = {}
+
 try:
     from kit.referee.rubric import (  # type: ignore
         CLASSES,
@@ -465,13 +472,9 @@ def _hedged_source_numbers(texts: Sequence[str]) -> list[float]:
 
 
 def _is_write(server: Any, tool: Any) -> bool:
-    try:
-        from kit.mcp.specs import TOOL_SPECS  # type: ignore
-        spec = TOOL_SPECS.get((server, tool))
-        if spec is not None:
-            return bool(getattr(spec, "is_write", False))
-    except ImportError:
-        pass
+    spec = _TOOL_SPECS.get((server, tool))
+    if spec is not None:
+        return bool(getattr(spec, "is_write", False))
     return (server, tool) in _WRITE_TOOLS
 
 
